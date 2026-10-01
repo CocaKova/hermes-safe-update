@@ -1,0 +1,4 @@
+#!/bin/sh
+# Pause timers that could act on the install mid-update (a config guard, a sync job).
+# List them in HSU_TIMERS="foo.timer". Restart them from a post.d hook.
+for t in ${HSU_TIMERS:-}; do systemctl --user stop "$t" || exit 1; done

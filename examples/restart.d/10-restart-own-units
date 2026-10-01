@@ -1,0 +1,9 @@
+#!/bin/sh
+# Upstream restarts the services it knows about. Anything you added around Hermes that imports
+# its code (a custom dashboard unit, a bridge) needs a restart onto the new (or rolled-back)
+# code too. List them in HSU_UNITS="foo.service bar.service". Runs after the update AND after
+# a rollback, before the battery.
+for u in ${HSU_UNITS:-}; do
+  systemctl --user reset-failed "$u" 2>/dev/null || true
+  systemctl --user restart "$u" || exit 1
+done

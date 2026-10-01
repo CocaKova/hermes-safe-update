@@ -1,0 +1,8 @@
+#!/bin/sh
+# For services you run yourself under systemd --user (dashboards, bridges, sidecars):
+# list them in HSU_UNITS="foo.service bar.service".
+for u in ${HSU_UNITS:-}; do
+  state="$(systemctl --user is-active "$u" || true)"
+  [ "$state" = active ] || { echo "$u is $state"; exit 1; }
+done
+echo "units active: ${HSU_UNITS:-none listed}"

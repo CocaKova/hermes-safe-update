@@ -1,0 +1,1143 @@
+#!/usr/bin/env python3
+"""hermes-safe-update: run Hermes Agent's own `hermes update`, prove the result works, and
+roll back automatically when it does not.
+
+    battery (before) -> snapshot -> upstream `hermes update` -> battery -> success
+                                                                   \\-> rollback -> battery
+
+Upstream's updater already pulls, migrates config, syncs dependencies, restarts the gateway
+fleet under whatever supervisor runs it, and checks that every gateway runs the new code.
+What it does not do is answer "does the agent still WORK?" and undo the update when the
+answer is no. This wrapper adds exactly that and nothing else:
+
+  * a battery BEFORE the update: if the running install does not pass it, an update could only
+    "fail" for reasons that have nothing to do with the update, so nothing is touched
+  * a snapshot: a git ref at the running commit (refs/hermes-safe-update/<id>) plus copies of
+    every config.yaml (main + profiles) and the gateway's service definition
+  * the battery AFTER: every gateway is up, stays up, runs the new commit, reconnected every
+    platform it had before, loaded every plugin, and a real agent turn answers; plus checks.d/
+  * a rollback to the snapshot when any of that fails, verified with the same battery
+
+Built to keep working while Hermes changes underneath it: every check that reads a Hermes
+surface (a state file, a CLI flag) reports UNKNOWN instead of FAIL when that surface is gone,
+and an UNKNOWN is only accepted when a real agent turn proved the install answers.
+
+Every run ends in exactly one of:
+  0  VERIFIED SUCCESS    (or nothing to do)
+  1  NOTHING CHANGED     preflight refused before anything was touched
+  2  usage error
+  3  VERIFIED ROLLBACK   the update failed verification; the snapshot is back and healthy
+  4  ROLLBACK UNHEALTHY  the snapshot is back but the battery still fails: look now
+  5  INTERRUPTED         stopped mid-update; nothing was rolled back (see the printed command)
+
+Requires: a git (source) install of Hermes Agent and Python 3.9+. Stdlib only.
+Docker / Nix / desktop-app installs update through their own channel and are refused.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import glob
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+VERSION = "0.2.0"
+REF_PREFIX = "refs/hermes-safe-update/"
+IS_WINDOWS = os.name == "nt"
+_LOG_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+# Log lines that mean the new code is not really running, whatever the process table says.
+# Matched case-insensitively; Hermes rewords these now and then, so keep them short.
+_FATAL_LOG_MARKERS = (
+    "failed to load plugin",          # a plugin raised on import/register; the gateway runs without it
+    "completion failed",              # dependency sync after the code change did not finish
+    "hermes pm repair",               # the runtime could not activate its dependencies
+)
+PASS, FAIL, UNKNOWN, SKIP = "pass", "fail", "unknown", "skip"
+_MARK = {PASS: "✓", FAIL: "✗", UNKNOWN: "?", SKIP: "-"}
+
+
+# ============================================================================= plumbing
+class Refusal(RuntimeError):
+    """Preflight said no; nothing has been touched."""
+
+
+class StepFailed(RuntimeError):
+    """A step after the snapshot failed; the caller rolls back."""
+
+
+class Log:
+    def __init__(self) -> None:
+        self.path = None
+
+    def __call__(self, msg: str = "") -> None:
+        print(msg, flush=True)
+        if self.path:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+
+
+log = Log()
+
+
+def clean_env(ctx=None) -> dict:
+    env = dict(os.environ)
+    # A caller's virtualenv or PYTHONPATH must never leak into Hermes' own interpreter.
+    for key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
+        env.pop(key, None)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    if ctx is not None:
+        env["HERMES_HOME"] = ctx.home
+    # Some Hermes dependencies (e.g. python-olm for Matrix E2E) have no wheel for every
+    # platform and build from source. The managed interpreter's sysconfig can name clang; on a
+    # box with gcc and no clang, point the build at gcc instead of dying on `clang++: not found`.
+    if not IS_WINDOWS and shutil.which("clang++") is None and shutil.which("g++") is not None:
+        env.setdefault("CC", "gcc")
+        env.setdefault("CXX", "g++")
+    return env
+
+
+def _decode(b) -> str:
+    return b.decode("utf-8", errors="replace") if isinstance(b, bytes) else (b or "")
+
+
+def run(cmd, ctx=None, cwd=None, check=False, timeout=None, quiet=False):
+    """Run a command, capture it, log the command and (unless quiet) its output."""
+    log(f"$ {' '.join(cmd)}")
+    try:
+        res = subprocess.run(cmd, cwd=cwd or (ctx.tree if ctx else None), env=clean_env(ctx),
+                             capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise StepFailed(f"timed out after {timeout}s: {' '.join(cmd)}")
+    except OSError as e:
+        raise StepFailed(f"could not run {cmd[0]}: {e}")
+    res.stdout, res.stderr = _decode(res.stdout), _decode(res.stderr)
+    out = (res.stdout + res.stderr).rstrip()
+    if out and not quiet:
+        for line in out.splitlines():
+            log("    " + line)
+    if check and res.returncode != 0:
+        raise StepFailed(f"exit {res.returncode}: {' '.join(cmd)}")
+    return res
+
+
+def run_live(cmd, ctx, timeout=None) -> int:
+    """Run a long command with its output shown live (the upstream updater) and tee'd to the log."""
+    log(f"$ {' '.join(cmd)}")
+    proc = subprocess.Popen(cmd, cwd=ctx.tree, env=clean_env(ctx), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    deadline = time.time() + timeout if timeout else None
+    for raw in proc.stdout:
+        log("    " + _decode(raw).rstrip("\r\n"))
+        if deadline and time.time() > deadline:
+            proc.kill()
+            raise StepFailed(f"timed out after {timeout}s: {' '.join(cmd)}")
+    return proc.wait()
+
+
+def git(ctx, *args, check=True) -> str:
+    res = subprocess.run(["git", *args], cwd=ctx.tree, capture_output=True)
+    if check and res.returncode != 0:
+        raise StepFailed(f"git {' '.join(args)}: {_decode(res.stderr).strip()}")
+    return _decode(res.stdout).strip()
+
+
+def pid_alive(pid) -> bool:
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if IS_WINDOWS:
+        # os.kill(pid, 0) on Windows sends CTRL_C_EVENT; ask the kernel instead.
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel32.CloseHandle(handle)
+        return bool(ok) and code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def take_lock(path: str):
+    """One run at a time per Hermes home. Returns the open handle, or None if taken."""
+    handle = open(path, "a+")
+    try:
+        if IS_WINDOWS:
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def read_dotenv(path) -> dict:
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                if k.startswith("export "):
+                    k = k[len("export "):].strip()
+                out[k] = v.strip().strip("'\"")
+    except OSError:
+        pass
+    return out
+
+
+def config_dir() -> str:
+    if os.environ.get("HSU_CONFIG_DIR"):
+        return os.environ["HSU_CONFIG_DIR"]
+    if IS_WINDOWS:
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "hermes-safe-update")
+
+
+def default_home() -> str:
+    """Hermes' own default: %LOCALAPPDATA%\\hermes on Windows, ~/.hermes elsewhere."""
+    suffix = os.environ.get("HERMES_DATA_DIR_SUFFIX", "")
+    if IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+        return os.path.join(base, "hermes" + suffix)
+    return os.path.join(os.path.expanduser("~"), ".hermes" + suffix)
+
+
+def systemd_user_dir() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "systemd", "user")
+
+
+def now() -> dt.datetime:
+    return dt.datetime.now().replace(microsecond=0)
+
+
+# ============================================================================= discovery
+class Ctx:
+    """Where this install lives, found by asking Hermes itself rather than assuming paths."""
+
+    def __init__(self, hermes: str, home: str) -> None:
+        self.cli = hermes
+        self.home = home
+        self.tree = ""
+        self.method = ""
+        self.snapdir = os.path.join(home, "safe-update")
+
+    @classmethod
+    def discover(cls, args) -> "Ctx":
+        home = os.path.abspath(os.path.expanduser(
+            args.home or os.environ.get("HERMES_HOME") or default_home()))
+        cli = args.hermes or shutil.which("hermes")
+        if not cli:
+            raise Refusal("no `hermes` on PATH; pass --hermes /path/to/hermes")
+        ctx = cls(cli, home)
+        res = subprocess.run([cli, "--version"], env=clean_env(ctx), capture_output=True, timeout=900)
+        text = _decode(res.stdout) + _decode(res.stderr)
+        m_dir = re.search(r"^\s*Install directory:\s*(.+?)\s*$", text, re.M)
+        m_how = re.search(r"^\s*Install method:\s*(.+?)\s*$", text, re.M)
+        if m_dir:
+            ctx.tree = m_dir.group(1)
+        else:
+            # Older or reworded `--version`: fall back to the checkout the CLI lives in.
+            ctx.tree = _tree_from_cli(cli)
+            if not ctx.tree:
+                raise Refusal(f"could not find the Hermes checkout: `{cli} --version` said:\n{text.strip()[-600:]}")
+        ctx.method = (m_how.group(1) if m_how else ("git" if os.path.isdir(os.path.join(ctx.tree, ".git")) else "unknown")).lower()
+        if ctx.method != "git" or not os.path.isdir(os.path.join(ctx.tree, ".git")):
+            raise Refusal(
+                f"this is a '{ctx.method}' install at {ctx.tree}. Only git (source) installs can be "
+                "snapshotted and rolled back; update packaged installs through their own channel.")
+        return ctx
+
+    def tree_cli(self) -> str:
+        """The CLI that matches the checkout AS IT IS NOW. After a rollback the launcher on PATH
+        can point at a runtime the restored code cannot use, so prefer the checkout's own."""
+        t = self.tree
+        launchers = [os.path.join(t, ".hermes", "bin", n) for n in ("hermes", "hermes.cmd", "hermes.exe")]
+        venv = [os.path.join(t, "venv", "bin", "hermes"), os.path.join(t, "venv", "Scripts", "hermes.exe")]
+        order = launchers + venv if self.pm_era() else venv + launchers
+        for path in order:
+            if os.path.isfile(path):
+                return path
+        return self.cli
+
+    def pm_era(self) -> bool:
+        """True when the checkout runs on upstream's package manager (2026-09-25 onwards): its
+        bootstrap activates a managed dependency generation instead of a plain in-tree venv."""
+        try:
+            with open(os.path.join(self.tree, "hermes_bootstrap.py"), encoding="utf-8") as f:
+                return "activate_dependencies" in f.read()
+        except OSError:
+            return False
+
+    def head(self) -> str:
+        return git(self, "rev-parse", "HEAD")
+
+    def branch(self):
+        name = git(self, "rev-parse", "--abbrev-ref", "HEAD")
+        return None if name == "HEAD" else name
+
+
+def _tree_from_cli(cli: str) -> str:
+    path = os.path.realpath(cli)
+    for _ in range(6):
+        path = os.path.dirname(path)
+        if os.path.isdir(os.path.join(path, ".git")) and os.path.isfile(os.path.join(path, "pyproject.toml")):
+            return path
+    return ""
+
+
+# ============================================================================= gateway state
+# Each Hermes home that runs a gateway keeps its own runtime record, gateway_state.json: pid,
+# state, the code sha it runs, and one entry per platform adapter with the pid that wrote it.
+# Profiles normally ride the default gateway (multiplexed); a profile that runs its own gateway
+# has its own record under profiles/<name>/.
+def state_files(ctx) -> list:
+    return [os.path.join(ctx.home, "gateway_state.json")] + sorted(
+        glob.glob(os.path.join(ctx.home, "profiles", "*", "gateway_state.json")))
+
+
+def gw_label(ctx, path: str) -> str:
+    parent = os.path.basename(os.path.dirname(path))
+    return "default" if os.path.dirname(path) == ctx.home else parent
+
+
+_UP_STATES = ("running", "degraded")  # degraded = up, with some platform unhappy
+
+
+def is_running(st: dict) -> bool:
+    return bool(st) and st.get("gateway_state") in _UP_STATES and pid_alive(st.get("pid"))
+
+
+def connected_platforms(st: dict):
+    """Adapters the CURRENT gateway process has connected, or None when the record does not say.
+    Entries written by an older pid are leftovers from platforms no longer configured."""
+    platforms = st.get("platforms")
+    if not isinstance(platforms, dict):
+        return None
+    pid = st.get("pid")
+    out = set()
+    for name, p in platforms.items():
+        if not isinstance(p, dict) or p.get("state") != "connected":
+            continue
+        writer = p.get("writer_pid", pid)  # records without writer_pid: trust the entry
+        if writer == pid:
+            out.add(name)
+    return out
+
+
+def baseline(ctx) -> dict:
+    """What is running before the update: every live gateway and the platforms it has up."""
+    gws = {}
+    for path in state_files(ctx):
+        st = read_json(path)
+        # A gateway that is still starting (just installed, just restarted) is about to be up;
+        # give it a minute rather than recording "no gateway" and skipping every gateway check.
+        deadline = time.time() + 60
+        while st and st.get("gateway_state") == "starting" and pid_alive(st.get("pid")) and time.time() < deadline:
+            time.sleep(2)
+            st = read_json(path)
+        if is_running(st):
+            plats = connected_platforms(st)
+            gws[path] = {"label": gw_label(ctx, path), "pid": st.get("pid"),
+                         "platforms": sorted(plats) if plats is not None else None}
+    has_record = os.path.exists(state_files(ctx)[0])
+    return {"gateways": gws, "record": has_record}
+
+
+def foreign_host_gateway(ctx) -> str:
+    """Upstream allows ONE gateway per host and records it in host-gateway.json. If a live
+    gateway from a DIFFERENT Hermes home holds it (a test install, a second checkout), the
+    updated gateway for this home refuses to start. Say so before touching anything."""
+    if IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    lock_dir = os.environ.get("HERMES_GATEWAY_LOCK_DIR") or os.path.join(base, "hermes", "gateway-locks")
+    rec = read_json(os.path.join(lock_dir, "host-gateway.json")) or {}
+    home = rec.get("home")
+    if not home or not pid_alive(rec.get("pid")):
+        return ""
+    if os.path.normcase(os.path.realpath(home)) == os.path.normcase(os.path.realpath(ctx.home)):
+        return ""
+    return f"pid {rec.get('pid')} serving HERMES_HOME={home}"
+
+
+# ============================================================================= snapshot files
+def backup_targets(ctx) -> list:
+    """Files upstream may rewrite during an update: every config.yaml (it migrates them in place,
+    and old code reading a newer schema is undefined) and the gateway's service definition (a
+    newer gateway can rewrite its own unit / plist to a launcher the old code cannot run)."""
+    user = os.path.expanduser("~")
+    paths = [os.path.join(ctx.home, "config.yaml")]
+    paths += sorted(glob.glob(os.path.join(ctx.home, "profiles", "*", "config.yaml")))
+    paths += sorted(glob.glob(os.path.join(systemd_user_dir(), "hermes*.service")))
+    paths += sorted(glob.glob(os.path.join(systemd_user_dir(), "hermes*.service.d", "*.conf")))
+    paths += sorted(glob.glob(os.path.join(user, "Library", "LaunchAgents", "*hermes*.plist")))
+    paths += sorted(glob.glob(os.path.join(ctx.home, "gateway-service", "*.vbs")))  # Windows launcher
+    return [p for p in paths if os.path.isfile(p)]
+
+
+def new_id() -> str:
+    return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def take_snapshot(ctx, base: dict) -> dict:
+    sid = new_id()
+    sdir = os.path.join(ctx.snapdir, sid)
+    os.makedirs(os.path.join(sdir, "files"), exist_ok=True)
+    sha = ctx.head()
+    git(ctx, "update-ref", REF_PREFIX + sid, sha)
+    files = []
+    for i, src in enumerate(backup_targets(ctx)):
+        dst = os.path.join(sdir, "files", f"{i:03d}-{os.path.basename(src)}")
+        shutil.copy2(src, dst)
+        files.append({"src": src, "copy": dst})
+    meta = {
+        "id": sid, "created": dt.datetime.now().isoformat(timespec="seconds"), "sha": sha,
+        "branch": ctx.branch(), "pm_era": ctx.pm_era(), "tree": ctx.tree, "home": ctx.home,
+        "files": files, "baseline": base, "tool_version": VERSION,
+    }
+    with open(os.path.join(sdir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+    log(f"snapshot {sid}: {sha[:10]} on {meta['branch'] or 'detached HEAD'}, "
+        f"{len(files)} file(s) copied, ref {REF_PREFIX}{sid}")
+    return meta
+
+
+def snapshot_files_unchanged(meta: dict) -> bool:
+    import filecmp
+    for item in meta.get("files", []):
+        if not os.path.exists(item["src"]) or not filecmp.cmp(item["src"], item["copy"], shallow=False):
+            return False
+    return True
+
+
+def load_snapshot(ctx, sid: str) -> dict:
+    meta = read_json(os.path.join(ctx.snapdir, sid, "meta.json"))
+    if not meta:
+        raise Refusal(f"no snapshot '{sid}' under {ctx.snapdir} (see --list)")
+    if "gateways" not in (meta.get("baseline") or {}):
+        meta["baseline"] = _upgrade_baseline(ctx, meta.get("baseline") or {})
+    return meta
+
+
+def _upgrade_baseline(ctx, old: dict) -> dict:
+    """Snapshots from 0.1.x recorded one gateway as {gateway, pid, platforms}."""
+    if not old.get("gateway"):
+        return {"gateways": {}, "record": True}
+    path = state_files(ctx)[0]
+    return {"gateways": {path: {"label": "default", "pid": old.get("pid"),
+                                "platforms": old.get("platforms")}}, "record": True}
+
+
+def list_snapshots(ctx) -> list:
+    out = []
+    for path in sorted(glob.glob(os.path.join(ctx.snapdir, "*", "meta.json"))):
+        meta = read_json(path)
+        if meta:
+            out.append(meta)
+    return out
+
+
+def prune_snapshots(ctx, keep: int) -> None:
+    snaps = list_snapshots(ctx)
+    for meta in snaps[:-keep] if keep > 0 else []:
+        git(ctx, "update-ref", "-d", REF_PREFIX + meta["id"], check=False)
+        shutil.rmtree(os.path.join(ctx.snapdir, meta["id"]), ignore_errors=True)
+        log(f"pruned snapshot {meta['id']}")
+
+
+# ============================================================================= hooks + checks
+def _hook_command(path: str):
+    """How to run one hook file, or None to skip it (READMEs, editor backups, ...)."""
+    name = os.path.basename(path)
+    if name.startswith(".") or name.endswith(("~", ".md", ".txt", ".bak", ".orig", ".swp")):
+        return None
+    if IS_WINDOWS:
+        ext = os.path.splitext(name)[1].lower()
+        if ext in (".cmd", ".bat", ".exe"):
+            return [path]
+        if ext == ".ps1":
+            return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path]
+        if ext == ".py":
+            return [sys.executable, path]
+        if ext in ("", ".sh") and shutil.which("bash"):
+            return ["bash", path]
+        return None
+    return [path] if os.access(path, os.X_OK) else None
+
+
+def run_dir(ctx, name: str, phase: str, extra_env=None) -> bool:
+    """Run every hook in <config>/<name>/ in name order. Returns False if any fails."""
+    d = os.path.join(config_dir(), name)
+    hooks = [(p, _hook_command(p)) for p in sorted(glob.glob(os.path.join(d, "*"))) if os.path.isfile(p)]
+    hooks = [(p, c) for p, c in hooks if c]
+    if not hooks:
+        return True
+    env = clean_env(ctx)
+    env.update({"HERMES_BIN": ctx.tree_cli(), "HERMES_TREE": ctx.tree, "HSU_PHASE": phase,
+                "HSU_HEAD": ctx.head(), "HSU_VERSION": VERSION})
+    env.update(extra_env or {})
+    ok = True
+    for path, cmd in hooks:
+        label = f"{name}/{os.path.basename(path)}"
+        try:
+            res = subprocess.run(cmd, cwd=ctx.home, env=env, capture_output=True,
+                                 timeout=int(os.environ.get("HSU_HOOK_TIMEOUT", "600")))
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log(f"  ✗ {label}: {e}")
+            ok = False
+            continue
+        log(f"  {'✓' if res.returncode == 0 else '✗'} {label} (exit {res.returncode})")
+        for line in (_decode(res.stdout) + _decode(res.stderr)).strip().splitlines()[-15:]:
+            log("      " + line)
+        ok = ok and res.returncode == 0
+    return ok
+
+
+# ============================================================================= the battery
+class Results:
+    def __init__(self) -> None:
+        self.items = []
+
+    def add(self, status: str, what: str) -> str:
+        self.items.append((status, what))
+        log(f"  {_MARK[status]} {what}")
+        return status
+
+    def has(self, status: str) -> bool:
+        return any(s == status for s, _ in self.items)
+
+
+def supervised(ctx, label: str, pid) -> bool:
+    """Is this gateway run by a service manager (systemd, launchd, a Windows scheduled task, or a
+    supervisor it declared)? Without one, `hermes gateway restart` runs the gateway in the
+    FOREGROUND of whoever called it, which is not something to do from here."""
+    suffix = "" if label == "default" else f"-{label}"
+    if IS_WINDOWS:
+        task = "Hermes_Gateway" + ("" if label == "default" else f"_{label}")
+        return subprocess.run(["schtasks", "/Query", "/TN", task], capture_output=True).returncode == 0
+    if sys.platform == "darwin":
+        plist = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", f"ai.hermes.gateway{suffix}.plist")
+        if os.path.exists(plist):
+            return True
+    try:  # systemd marks every process it starts; so does anything that ran it as a service
+        with open(f"/proc/{int(pid)}/environ", "rb") as f:
+            env = f.read()
+        if b"INVOCATION_ID=" in env or b"XPC_SERVICE_NAME=" in env:
+            return True
+    except (OSError, TypeError, ValueError):
+        pass
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            if b"--external-supervisor" in f.read():
+                return True
+    except (OSError, TypeError, ValueError):
+        pass
+    units = (os.path.join(systemd_user_dir(), f"hermes-gateway{suffix}.service"),
+             f"/etc/systemd/system/hermes-gateway{suffix}.service")
+    return any(os.path.exists(u) for u in units)
+
+
+def restart_gateway(ctx, opts, label: str = "default", pid=None) -> None:
+    """Restart one gateway onto the code that is checked out now. Supervised: `hermes gateway
+    restart` (it waits for the new process, so on broken code it can hang; a timeout is a
+    finding, not a crash). Foreground: what upstream's updater does with one: stop it and
+    relaunch `hermes gateway run` detached, output in logs/gateway-stdio.log."""
+    profile = [] if label == "default" else ["-p", label]
+    if supervised(ctx, label, pid):
+        try:
+            run([ctx.tree_cli(), *profile, "gateway", "restart"], ctx, timeout=opts.restart_timeout)
+        except StepFailed as e:
+            log(f"  ! {e}")
+        return
+    if IS_WINDOWS:
+        log(f"  ! gateway [{label}] has no scheduled task; restart it yourself: hermes gateway run")
+        return
+    if pid_alive(pid):
+        import signal
+        os.kill(int(pid), signal.SIGTERM)
+        for _ in range(60):
+            if not pid_alive(pid):
+                break
+            time.sleep(1)
+    out = open(os.path.join(ctx.home, "logs", "gateway-stdio.log"), "ab")
+    subprocess.Popen([ctx.tree_cli(), *profile, "gateway", "run"], cwd=ctx.home, env=clean_env(ctx),
+                     stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True)
+    log(f"  ! gateway [{label}] runs in the foreground (no service); relaunched it detached, "
+        "output in logs/gateway-stdio.log")
+
+
+def _wait_running(path: str, head, timeout: int) -> dict:
+    """Wait until the record says running on `head` (any commit when head is None, or when the
+    record carries no code_sha at all)."""
+    deadline = time.time() + timeout
+    while True:
+        st = read_json(path) or {}
+        if is_running(st) and (head is None or st.get("code_sha", head) == head):
+            return st
+        if time.time() >= deadline:
+            return {}
+        time.sleep(2)
+
+
+def check_gateways(ctx, base: dict, opts, r: Results, phase: str) -> dict:
+    """Every gateway that ran before is up on HEAD, stable over the settle window, and has every
+    platform it had connected before. Returns {path: live state} for the ones that passed."""
+    gws = base.get("gateways") or {}
+    if not gws:
+        # No record at all means no gateway has run in this home yet (a fresh install, a CLI-only
+        # user). If Hermes ever renames the file, the weekly CI crash scenario stops passing.
+        r.add(SKIP, "gateway: none was running before; not checked")
+        return {}
+    head = ctx.head()
+    live = {}
+    for path, before in gws.items():
+        label = before.get("label") or gw_label(ctx, path)
+        # Before the update, a gateway that runs an older commit than the checkout is not this
+        # tool's business (the update restarts it anyway); after it, that is the whole question.
+        want_sha = None if phase == "preflight" else head
+        st = _wait_running(path, want_sha, opts.gateway_timeout if phase in ("update", "rollback") else 5)
+        if not st and phase in ("update", "rollback"):
+            cur = read_json(path) or {}
+            log(f"  ! gateway [{label}] not running on {head[:10]} after {opts.gateway_timeout}s "
+                f"(state={cur.get('gateway_state')}, pid={cur.get('pid')}, "
+                f"sha={str(cur.get('code_sha'))[:10]}); restarting it once, as upstream advises")
+            restart_gateway(ctx, opts, label, cur.get("pid"))
+            st = _wait_running(path, head, opts.gateway_timeout)
+        if not st:
+            cur = read_json(path) or {}
+            r.add(FAIL, f"gateway [{label}]: not running on {head[:10]} (state={cur.get('gateway_state')}, "
+                        f"sha={str(cur.get('code_sha'))[:10]})")
+            continue
+        pid = st.get("pid")
+        if want_sha is None:
+            r.add(PASS, f"gateway [{label}]: running (pid {pid})")
+        elif "code_sha" in st:
+            r.add(PASS, f"gateway [{label}]: running on {head[:10]} (pid {pid})")
+        else:
+            r.add(UNKNOWN, f"gateway [{label}]: running (pid {pid}) but its record has no code_sha; "
+                           "cannot confirm which commit it runs")
+
+        # Stability + platforms: a crash-looping gateway passes any single look; watch it.
+        want = before.get("platforms")
+        want = None if want is None else set(want) - set(opts.ignore_platform)
+        settle_end = time.time() + max(opts.settle if phase in ("update", "rollback") else min(opts.settle, 5), 1)
+        give_up = settle_end + opts.platform_timeout
+        missing, stable = set(), True
+        while True:
+            cur = read_json(path) or {}
+            if cur.get("pid") != pid or not is_running(cur):
+                r.add(FAIL, f"gateway [{label}]: pid {pid} did not stay up (now pid={cur.get('pid')}, "
+                            f"state={cur.get('gateway_state')}): crash or restart loop")
+                stable = False
+                break
+            have = connected_platforms(cur)
+            missing = set() if want is None or have is None else want - have
+            t = time.time()
+            if t >= settle_end and (not missing or t >= give_up):
+                break
+            time.sleep(2)
+        if not stable:
+            continue
+        r.add(PASS, f"gateway [{label}]: same process after the settle window")
+        if want is None or connected_platforms(cur) is None:
+            r.add(UNKNOWN, f"platforms [{label}]: the record does not list platform adapters")
+        elif missing:
+            r.add(FAIL, f"platforms [{label}]: connected before the update but not now: {', '.join(sorted(missing))}")
+        elif want:
+            r.add(PASS, f"platforms [{label}]: {', '.join(sorted(want))} connected")
+        live[path] = cur
+    return live
+
+
+def check_logs(ctx, since: dt.datetime, r: Results) -> None:
+    """No plugin-load or dependency-activation failures logged since `since`."""
+    bad = []
+    for path in glob.glob(os.path.join(ctx.home, "logs", "*.log")):
+        try:
+            if dt.datetime.fromtimestamp(os.path.getmtime(path)) < since:
+                continue
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    m = _LOG_TS.match(line)
+                    if not m or dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S") < since:
+                        continue
+                    if any(marker in line.lower() for marker in _FATAL_LOG_MARKERS):
+                        bad.append(f"{os.path.basename(path)}: {line.rstrip()[:220]}")
+        except (OSError, ValueError):
+            continue
+    # Startup failures before logging is configured (the bootstrap's own messages) go to the
+    # service's stdout/stderr. Under systemd that is the journal; read it when there is one.
+    unit = "hermes-gateway.service"
+    if shutil.which("journalctl") and subprocess.run(
+            ["systemctl", "--user", "cat", unit], capture_output=True).returncode == 0:
+        jr = subprocess.run(["journalctl", "--user", "-u", unit, "--since", since.strftime("%Y-%m-%d %H:%M:%S"),
+                             "--no-pager", "-o", "cat"], capture_output=True)
+        bad += [f"journal: {l[:220]}" for l in _decode(jr.stdout).splitlines()
+                if any(marker in l.lower() for marker in _FATAL_LOG_MARKERS)]
+    if bad:
+        r.add(FAIL, "logs: failures since the update started:")
+        for b in bad[-10:]:
+            log("      " + b)
+    else:
+        r.add(PASS, "logs: no plugin-load or dependency failures")
+
+
+def check_plugins(ctx, r: Results) -> None:
+    """`hermes plugins compat` where this Hermes version has it (it has come and gone)."""
+    try:
+        helptext = run([ctx.tree_cli(), "plugins", "--help"], ctx, timeout=120, quiet=True).stdout
+    except StepFailed:
+        return
+    if not re.search(r"\bcompat\b", helptext or ""):
+        return
+    try:
+        res = run([ctx.tree_cli(), "plugins", "compat"], ctx, timeout=300, quiet=True)
+    except StepFailed as e:
+        r.add(FAIL, f"plugins compat: {e}")
+        return
+    if res.returncode != 0:
+        r.add(FAIL, "plugins compat: not clean")
+        for line in (res.stdout + res.stderr).strip().splitlines()[-8:]:
+            log("      " + line)
+    else:
+        r.add(PASS, "plugins compat: clean")
+
+
+def _api_turn(url: str, key: str, prompt: str, timeout: int) -> str:
+    session = f"hermes-safe-update-{secrets.token_hex(4)}"
+    body = json.dumps({"model": "hermes", "stream": False,
+                       "messages": [{"role": "user", "content": prompt}]}).encode()
+    req = urllib.request.Request(f"{url}/v1/chat/completions", data=body, method="POST", headers={
+        "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+        "X-Hermes-Session-Id": session})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.load(resp)
+        return (data["choices"][0]["message"]["content"] or "").strip()
+    finally:
+        # A fresh session per run, then gone: a long-lived test transcript teaches the model to
+        # imitate its own old answers instead of exercising the code under test.
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                f"{url}/api/sessions/{session}", method="DELETE",
+                headers={"Authorization": f"Bearer {key}"}), timeout=10)
+        except (urllib.error.URLError, OSError):
+            pass
+
+
+def _usage_error(res) -> bool:
+    text = (res.stdout + res.stderr).lower()
+    return res.returncode == 2 and ("usage:" in text or "unrecognized" in text or "invalid choice" in text)
+
+
+def _cli_turn(ctx, prompt: str, timeout: int):
+    """One-shot turn through the CLI. Returns (reply, how) or (None, why) if no form is accepted."""
+    forms = (["-z", prompt], ["chat", "-q", prompt, "--oneshot", "-Q"], ["chat", "-q", prompt, "-Q"])
+    for form in forms:
+        res = run([ctx.tree_cli(), *form], ctx, timeout=timeout, quiet=True)
+        if _usage_error(res):
+            continue
+        if res.returncode != 0:
+            tail = (res.stdout + res.stderr).strip()[-300:]
+            raise StepFailed(f"`hermes {form[0]}` exited {res.returncode}: {tail}")
+        return res.stdout.strip(), " ".join(form[:-1] if form[0] == "-z" else form[:2])
+    return None, "this Hermes accepts none of `-z`, `chat -q --oneshot`, `chat -q -Q`"
+
+
+def check_turn(ctx, live: dict, opts, r: Results) -> None:
+    """A real agent turn must answer with a nonce. Through the gateway's API server when it is
+    up (that exercises the gateway itself), else through the CLI's one-shot mode."""
+    if opts.turn == "off":
+        r.add(SKIP, "agent turn: skipped (--no-turn)")
+        return
+    nonce = f"HSU-{secrets.token_hex(3).upper()}"
+    prompt = f"Health check after a software update. Reply with exactly this token and nothing else: {nonce}"
+    env = {**read_dotenv(os.path.join(ctx.home, ".env")), **os.environ}
+    key = env.get("API_SERVER_KEY", "")
+    api_up = any("api_server" in (connected_platforms(st) or ()) for st in live.values())
+    # The adapter publishes where it listens; the env var and the default are fallbacks.
+    listener = next((((st.get("platforms") or {}).get("api_server") or {}).get("listener_base")
+                     for st in live.values() if ((st.get("platforms") or {}).get("api_server") or {}).get("listener_base")), None)
+    url = (os.environ.get("HSU_API_URL") or listener
+           or f"http://127.0.0.1:{env.get('API_SERVER_PORT', '8642')}").rstrip("/")
+    use_api = opts.turn == "api" or (opts.turn == "auto" and bool(key) and api_up)
+    reply, via = None, ""
+    if use_api:
+        via = f"gateway API {url}"
+        try:
+            reply = _api_turn(url, key, prompt, opts.turn_timeout)
+        except (urllib.error.URLError, OSError, KeyError, ValueError, IndexError) as e:
+            if opts.turn == "api":
+                r.add(FAIL, f"agent turn via {via}: {e}")
+                return
+            log(f"  ! gateway API at {url} did not answer ({e}); set HSU_API_URL if it listens "
+                "elsewhere. Using the CLI instead.")
+            use_api = False
+    if not use_api:
+        try:
+            reply, how = _cli_turn(ctx, prompt, opts.turn_timeout)
+        except StepFailed as e:
+            r.add(FAIL, f"agent turn via the CLI: {e}")
+            return
+        if reply is None:
+            r.add(UNKNOWN, f"agent turn: {how}")
+            return
+        via = f"CLI `hermes {how}`"
+    if nonce in reply:
+        r.add(PASS, f"agent turn via {via}: answered")
+    else:
+        r.add(FAIL, f"agent turn via {via}: the reply did not contain {nonce}: {reply[:300]!r}")
+
+
+def battery(ctx, base: dict, since: dt.datetime, opts, phase: str) -> bool:
+    """phase: preflight (before anything changes), update, rollback, verify (on demand)."""
+    log(f"\n--- battery ({phase}) ---")
+    r = Results()
+    live = check_gateways(ctx, base, opts, r, phase)
+    if phase != "preflight":  # before the update, old log lines say nothing about this run
+        check_logs(ctx, since, r)
+    check_plugins(ctx, r)
+    if not r.has(FAIL):  # a turn against a gateway already known broken only adds minutes
+        check_turn(ctx, live, opts, r)
+    if not r.has(FAIL):
+        pids = ",".join(str(st.get("pid")) for st in live.values())
+        if not run_dir(ctx, "checks.d", phase, {"HSU_GATEWAY_PID": pids.split(",")[0] if pids else "",
+                                                 "HSU_GATEWAY_PIDS": pids}):
+            r.items.append((FAIL, "checks.d"))
+    ok = not r.has(FAIL)
+    if ok and r.has(UNKNOWN):
+        turned = any(s == PASS and w.startswith("agent turn") for s, w in r.items)
+        if turned:
+            log("  note: some checks could not run on this Hermes version; the agent turn answered, "
+                "so that is accepted")
+        else:
+            log("  ✗ some checks could not run on this Hermes version and no agent turn proved the "
+                "install works. Run without --no-turn (or update hermes-safe-update).")
+            ok = False
+    log(f"--- battery: {'PASS' if ok else 'FAIL'} ---")
+    return ok
+
+
+# ============================================================================= flows
+def finish_completion(ctx) -> None:
+    """On a package-manager checkout, the first CLI start after a code change performs any
+    pending dependency sync. Do it now, synchronously, so no service starts on half-synced deps."""
+    res = run([ctx.tree_cli(), "--version"], ctx, timeout=1800, quiet=True)
+    err = res.stdout + res.stderr
+    if "completion failed" in err or "pm repair" in err:
+        raise StepFailed("dependency sync did not complete:\n" + err.strip()[-600:])
+
+
+def preflight(ctx, opts) -> dict:
+    if not opts.allow_dirty:
+        dirty = git(ctx, "status", "--porcelain", "--untracked-files=no")
+        if dirty:
+            raise Refusal("tracked files in the Hermes checkout are modified. A rollback resets the "
+                          "checkout, which would destroy them; commit them to a branch or stash "
+                          "them first (or pass --allow-dirty to accept that):\n" + dirty)
+    untracked = git(ctx, "status", "--porcelain", "--untracked-files=normal")
+    stray = [l[3:] for l in untracked.splitlines() if l.startswith("??")]
+    if stray:
+        log(f"note: {len(stray)} untracked file(s) in the checkout; upstream may stash them "
+            f"during the update: {', '.join(stray[:5])}{' …' if len(stray) > 5 else ''}")
+    foreign = foreign_host_gateway(ctx)
+    if foreign:
+        raise Refusal(f"another Hermes home's gateway owns this host ({foreign}). The updated "
+                      "gateway for this home could not start. Stop that gateway, or give it its "
+                      "own HERMES_GATEWAY_LOCK_DIR, then retry.")
+    base = baseline(ctx)
+    for g in base["gateways"].values():
+        plats = "unknown" if g["platforms"] is None else (", ".join(g["platforms"]) or "none")
+        log(f"gateway     : [{g['label']}] running, pid {g['pid']}, platforms: {plats}")
+    if not base["gateways"]:
+        log("gateway     : none running (gateway checks skipped; the agent turn uses the CLI)")
+    return base
+
+
+def restore(ctx, meta: dict) -> None:
+    """Put the checkout and the snapshotted files back exactly as they were."""
+    sha = meta["sha"]
+    if meta.get("branch"):
+        git(ctx, "checkout", "-f", meta["branch"])
+        git(ctx, "reset", "--hard", sha)
+    else:
+        git(ctx, "checkout", "-f", "--detach", sha)
+    log(f"checkout    : {meta.get('branch') or 'detached'} @ {sha[:10]}")
+    rejected = os.path.join(ctx.snapdir, meta["id"], f"rejected-{new_id()}")
+    units = []
+    for item in meta.get("files", []):
+        src, copy = item["src"], item["copy"]
+        if not os.path.exists(copy):
+            log(f"⚠ snapshot copy missing for {src}; left as is")
+            continue
+        if os.path.exists(src):
+            os.makedirs(rejected, exist_ok=True)
+            shutil.copy2(src, os.path.join(rejected, os.path.basename(copy)))
+        shutil.copy2(copy, src)
+        if src.endswith((".service", ".conf", ".plist")):
+            units.append(src)
+    log(f"files       : {len(meta.get('files', []))} restored (the rejected versions are in {rejected})")
+    if any(u.endswith((".service", ".conf")) for u in units) and shutil.which("systemctl"):
+        run(["systemctl", "--user", "daemon-reload"], ctx)
+    # Dependencies for the restored code.
+    if ctx.pm_era():
+        finish_completion(ctx)
+    else:
+        venv_py = next((p for p in (os.path.join(ctx.tree, "venv", "bin", "python"),
+                                    os.path.join(ctx.tree, "venv", "Scripts", "python.exe"))
+                        if os.path.exists(p)), None)
+        if not venv_py:
+            raise StepFailed("the restored checkout expects an in-tree venv/ that no longer exists")
+        uv = shutil.which("uv")
+        cmd = [uv, "pip", "install", "-e", ".", "-p", venv_py] if uv else [venv_py, "-m", "pip", "install", "-e", "."]
+        run(cmd, ctx, check=True, timeout=1800, quiet=True)
+    # An aborted update can leave a restart obligation for the code just rejected; the rollback
+    # restarts everything itself, so drop it rather than have every CLI start warn about it.
+    try:
+        os.remove(os.path.join(ctx.home, "fleet_restart_pending"))
+    except FileNotFoundError:
+        pass
+
+
+def rollback(ctx, meta: dict, opts, why: str) -> int:
+    log(f"\n=== ROLLBACK to snapshot {meta['id']} ({meta['sha'][:10]}): {why} ===")
+    since = now()
+    try:
+        restore(ctx, meta)
+    except (StepFailed, OSError) as e:
+        log(f"✗ restore step failed: {e}")
+    base = meta.get("baseline") or {}
+    for path, g in (base.get("gateways") or {}).items():
+        restart_gateway(ctx, opts, g.get("label") or "default", (read_json(path) or {}).get("pid"))
+    run_dir(ctx, "restart.d", "rollback")
+    ok = battery(ctx, base, since, opts, "rollback")
+    run_dir(ctx, "post.d", "rollback", {"HSU_RESULT": "rollback" if ok else "rollback-unhealthy"})
+    if ok:
+        log(f"\n=== VERIFIED ROLLBACK: back on {meta['sha'][:10]}, battery green. Log: {log.path} ===")
+        return 3
+    log("\n=== ROLLBACK UNHEALTHY: the snapshot is restored but the battery fails. "
+        f"Check `hermes gateway status` and the gateway log now. Log: {log.path} ===")
+    return 4
+
+
+def cmd_update(ctx, opts) -> int:
+    try:
+        base = preflight(ctx, opts)
+        log(f"checkout    : {ctx.branch() or 'detached'} @ {ctx.head()[:10]} ({ctx.tree})")
+        res = run([ctx.tree_cli(), "update", "--check", *opts.upstream_args], ctx, timeout=600)
+        check_out = (res.stdout + res.stderr).lower()
+        if res.returncode != 0:
+            raise Refusal("`hermes update --check` failed")
+        if "up to date" in check_out and "available" not in check_out:
+            log("Already up to date: nothing to do.")
+            return 0
+        if opts.check:
+            return 0
+        if not opts.skip_preflight_battery and not battery(ctx, base, now(), opts, "preflight"):
+            raise Refusal("the install fails the battery BEFORE updating, so an update could only "
+                          "roll back for reasons unrelated to it. Fix that first (see above), or "
+                          "pass --skip-preflight-battery if the update is meant to fix it.")
+    except Refusal as e:
+        log(f"✗ preflight: {e}")
+        return 1
+    except StepFailed as e:
+        log(f"✗ preflight: {e}")
+        return 1
+    if not opts.yes:
+        try:
+            reply = input("\nUpdate now? A snapshot is taken first. [y/N] ")
+        except EOFError:
+            reply = ""
+        if reply.strip().lower() not in ("y", "yes"):
+            log("Aborted: nothing was touched.")
+            return 0
+    if not run_dir(ctx, "pre.d", "update"):
+        log("✗ a pre.d hook failed: nothing was touched")
+        return 1
+
+    try:
+        meta = take_snapshot(ctx, base)
+    except (StepFailed, OSError) as e:
+        log(f"✗ snapshot failed: {e}: nothing was changed")
+        run_dir(ctx, "post.d", "update", {"HSU_RESULT": "nothing-changed"})
+        return 1
+
+    since = now()
+    try:
+        log("\n=== upstream `hermes update` ===")
+        rc = run_live([ctx.tree_cli(), "update", "--yes", *opts.upstream_args], ctx, timeout=opts.update_timeout)
+        new, old = ctx.head(), meta["sha"]
+        # Judge the outcome, not the exit code: upstream can exit non-zero after a complete
+        # update (e.g. its own post-restart fleet probe found no rows). The battery decides.
+        if new == old:
+            if rc != 0 and snapshot_files_unchanged(meta):
+                # Upstream refused up front (another update running, a docker image, a dirty
+                # tree it will not touch): nothing changed, so there is nothing to roll back.
+                log(f"\n✗ upstream `hermes update` exited {rc} without changing anything; see its "
+                    "output above. NOTHING CHANGED.")
+                run_dir(ctx, "post.d", "update", {"HSU_RESULT": "nothing-changed"})
+                return 1
+            if rc != 0:
+                raise StepFailed(f"upstream exited {rc} and the checkout did not move")
+            log("note: the checkout did not move; verifying anyway (config may have migrated)")
+        elif meta.get("branch") and ctx.branch() == meta["branch"] and \
+                subprocess.run(["git", "merge-base", "--is-ancestor", old, new], cwd=ctx.tree).returncode != 0:
+            raise StepFailed(f"{meta['branch']} moved to {new[:10]}, which does not descend from {old[:10]}")
+        if rc != 0:
+            log(f"⚠ upstream exited {rc} after moving the checkout to {new[:10]}; the battery decides")
+        log(f"checkout    : {ctx.branch() or 'detached'} @ {new[:10]}")
+        finish_completion(ctx)
+        if not run_dir(ctx, "restart.d", "update"):
+            raise StepFailed("a restart.d hook failed")
+        if not battery(ctx, base, since, opts, "update"):
+            raise StepFailed("the battery failed on the new code")
+    except StepFailed as e:
+        return rollback(ctx, meta, opts, str(e))
+    except KeyboardInterrupt:
+        # Ctrl-C reaches upstream's updater too, which may still be finishing or holding its
+        # lock; rolling back underneath it would race. Hand the decision back to the human.
+        log(f"\n=== INTERRUPTED: nothing was rolled back. Once `hermes update` has stopped, run "
+            f"`hermes-safe-update --rollback {meta['id']}` to restore, or `--verify` to check. ===")
+        return 5
+
+    if ctx.pm_era():
+        run([ctx.tree_cli(), "pm", "gc"], ctx, timeout=600, quiet=True)
+    prune_snapshots(ctx, opts.keep)
+    run_dir(ctx, "post.d", "update", {"HSU_RESULT": "success"})
+    log(f"\n=== VERIFIED SUCCESS: {meta['sha'][:10]} → {ctx.head()[:10]}, battery green ===")
+    log(f"undo        : hermes-safe-update --rollback {meta['id']}")
+    log(f"log         : {log.path}")
+    return 0
+
+
+def cmd_list(ctx) -> int:
+    snaps = list_snapshots(ctx)
+    if not snaps:
+        print(f"no snapshots under {ctx.snapdir}")
+    for m in snaps:
+        print(f"{m['id']}  {m['sha'][:10]}  {m.get('branch') or 'detached':<12} {len(m.get('files', []))} files")
+    return 0
+
+
+def main(argv=None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            # Piped or redirected on Windows, Python writes the legacy code page and ✓ becomes "?",
+            # which reads like this tool's own "could not check" mark. Write UTF-8 instead.
+            if not stream.isatty():
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            else:
+                stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+    ap = argparse.ArgumentParser(
+        prog="hermes-safe-update",
+        description="Run `hermes update`, verify the agent still works, roll back if it does not.",
+        epilog="Arguments after `--` go to `hermes update` unchanged (e.g. -- --branch main).")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    ap.add_argument("--check", action="store_true", help="preflight + `hermes update --check`; change nothing")
+    ap.add_argument("--verify", action="store_true", help="run the battery against the running install; change nothing")
+    ap.add_argument("--list", action="store_true", help="list snapshots")
+    ap.add_argument("--rollback", metavar="ID", help="restore a snapshot and verify it")
+    ap.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    ap.add_argument("--no-turn", dest="turn", action="store_const", const="off", default="auto",
+                    help="skip the real agent turn (faster; a slow local model can take minutes)")
+    ap.add_argument("--turn", choices=("auto", "api", "cli", "off"), dest="turn",
+                    help="how to run the agent turn (default auto: gateway API if up, else CLI)")
+    ap.add_argument("--ignore-platform", action="append", default=[], metavar="NAME",
+                    help="do not require this platform to reconnect (repeatable), e.g. during its outage")
+    ap.add_argument("--skip-preflight-battery", action="store_true",
+                    help="update even though the running install fails the battery")
+    ap.add_argument("--allow-dirty", action="store_true", help="update even with modified tracked files (a rollback discards them)")
+    ap.add_argument("--hermes", help="path to the hermes CLI (default: first on PATH)")
+    ap.add_argument("--home", help="HERMES_HOME (default: $HERMES_HOME or ~/.hermes)")
+    ap.add_argument("--keep", type=int, default=5, help="snapshots to keep after a success (default 5)")
+    ap.add_argument("--settle", type=int, default=20, help="seconds a gateway must stay up (default 20)")
+    ap.add_argument("--gateway-timeout", type=int, default=180, help="seconds to wait for a gateway on the new code")
+    ap.add_argument("--restart-timeout", type=int, default=180, help="seconds to allow `hermes gateway restart`")
+    ap.add_argument("--platform-timeout", type=int, default=90, help="extra seconds for platforms to reconnect")
+    ap.add_argument("--turn-timeout", type=int, default=300, help="seconds for the agent turn (default 300)")
+    ap.add_argument("--log-window", type=int, default=15, help="--verify: minutes of logs to scan (default 15)")
+    ap.add_argument("--update-timeout", type=int, default=3600, help="seconds for upstream `hermes update`")
+    argv = list(sys.argv[1:] if argv is None else argv)
+    upstream = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, upstream = argv[:i], argv[i + 1:]
+    opts = ap.parse_args(argv)
+    opts.upstream_args = upstream
+
+    try:
+        ctx = Ctx.discover(opts)
+    except (Refusal, OSError, subprocess.TimeoutExpired) as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 1
+    if opts.list:
+        return cmd_list(ctx)
+
+    os.makedirs(os.path.join(ctx.home, "logs", "safe-update"), exist_ok=True)
+    log.path = os.path.join(ctx.home, "logs", "safe-update", f"{new_id()}.log")
+    log(f"hermes-safe-update {VERSION}: {ctx.tree} (HERMES_HOME={ctx.home})")
+
+    lock = take_lock(os.path.join(ctx.home, "safe-update.lock"))
+    if lock is None:
+        log("✗ another hermes-safe-update run holds the lock")
+        return 1
+
+    if opts.verify:
+        since = now() - dt.timedelta(minutes=opts.log_window)
+        return 0 if battery(ctx, baseline(ctx), since, opts, "verify") else 1
+    if opts.rollback:
+        try:
+            meta = load_snapshot(ctx, opts.rollback)
+        except Refusal as e:
+            log(f"✗ {e}")
+            return 1
+        if os.path.normcase(os.path.realpath(meta.get("tree", ctx.tree))) != os.path.normcase(os.path.realpath(ctx.tree)):
+            log(f"✗ snapshot {meta['id']} belongs to {meta.get('tree')}, not {ctx.tree}")
+            return 1
+        rc = rollback(ctx, meta, opts, "requested")
+        return 0 if rc == 3 else rc
+    return cmd_update(ctx, opts)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

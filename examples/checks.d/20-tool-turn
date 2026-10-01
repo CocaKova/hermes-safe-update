@@ -1,0 +1,12 @@
+#!/bin/sh
+# A turn that MUST call a tool. The built-in turn proves the model answers; this proves tool
+# calls still round-trip (a parser or schema regression breaks them while plain chat works).
+# Uses the CLI one-shot so it works with or without the gateway's API server.
+set -eu
+nonce="HSU$(date +%s)"
+reply="$("$HERMES_BIN" -z "Use your terminal tool to run: echo $nonce | rev   Then reply with only the command's output.")"
+expected="$(printf '%s' "$nonce" | rev)"
+case "$reply" in
+  *"$expected"*) echo "tool turn ok"; exit 0 ;;
+  *) echo "tool turn did not return $expected: $reply" | head -c 400; exit 1 ;;
+esac

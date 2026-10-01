@@ -1,0 +1,4 @@
+#!/bin/sh
+# Counterpart of pre.d/10-stop-own-timers: start them again whatever the outcome.
+# HSU_RESULT is success | rollback | rollback-unhealthy | nothing-changed.
+for t in ${HSU_TIMERS:-}; do systemctl --user start "$t" || true; done

@@ -1,0 +1,7 @@
+#!/bin/sh
+# The web dashboard answers (if you run one). Any HTTP status means the server is up; a
+# connection failure means it did not come back after the update.
+port="${HERMES_DASHBOARD_PORT:-9119}"
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:$port/" || true)"
+[ -n "$code" ] && [ "$code" != "000" ] || { echo "dashboard :$port not answering"; exit 1; }
+echo "dashboard :$port answered HTTP $code"
